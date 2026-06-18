@@ -229,6 +229,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         invalidate_runtime_client(region)
                     raise
                 result["response"] = normalize_converse_response(raw_response)
+            elif agent.api_mode == "noneusr_claude":
+                # NoneUSR Claude — custom GET-based API, no OpenAI client needed.
+                from agent.transports.noneusr_claude import call_noneusr_claude
+                result["response"] = call_noneusr_claude(api_kwargs)
             else:
                 request_client = _set_request_client(
                     agent._create_request_openai_client(
@@ -1166,6 +1170,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+        elif fb_provider in {"noneusr-claude", "noneusr_claude", "noneusr"}:
+            fb_api_mode = "noneusr_claude"
 
         old_model = agent.model
 
@@ -1593,6 +1599,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             return agent._interruptible_api_call(api_kwargs)
         finally:
             agent._codex_on_first_delta = None
+
+    # NoneUSR Claude — non-streaming API, pseudo-stream by chunking the response.
+    if agent.api_mode == "noneusr_claude":
+        result = {"response": None, "error": None}
+
+        def _noneusr_call():
+            try:
+                from agent.transports.noneusr_claude import stream_noneusr_claude
+                result["response"] = stream_noneusr_claude(
+                    api_kwargs,
+                    on_delta=agent._fire_stream_delta if agent._has_stream_consumers() else None,
+                    on_first_delta=on_first_delta,
+                    interrupt_check=lambda: agent._interrupt_requested,
+                )
+            except Exception as e:
+                result["error"] = e
+
+        t = threading.Thread(target=_noneusr_call, daemon=True)
+        t.start()
+        while t.is_alive():
+            t.join(timeout=0.3)
+            if agent._interrupt_requested:
+                raise InterruptedError("Agent interrupted during NoneUSR Claude call")
+        if result["error"] is not None:
+            raise result["error"]
+        return result["response"]
 
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.

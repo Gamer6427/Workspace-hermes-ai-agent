@@ -313,8 +313,11 @@ def init_agent(
     agent.provider = provider_name or ""
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "noneusr_claude"}:
         agent.api_mode = api_mode
+    elif agent.provider in {"noneusr-claude", "noneusr_claude", "noneusr"}:
+        agent.api_mode = "noneusr_claude"
+        agent.provider = "noneusr-claude"
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
     elif agent.provider in {"xai", "xai-oauth"}:

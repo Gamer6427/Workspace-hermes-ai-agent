@@ -1,0 +1,4 @@
+name: noneusr-claude
+kind: model-provider
+version: "1.0.0"
+description: "NoneUSR Claude — claude-opus-4.7 / claude-opus-4.8 via custom GET API"

@@ -156,6 +156,10 @@ def _xai_curated_models() -> list[str]:
 
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
+    "noneusr-claude": [
+        "claude-opus-4.7",
+        "claude-opus-4.8",
+    ],
     "nous": [
         # Anthropic
         "anthropic/claude-opus-4.8",
