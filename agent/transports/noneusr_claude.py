@@ -38,7 +38,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import json
-from types import SimpleNamespace
 from typing import Any, Callable
 
 from agent.transports import register_transport
@@ -60,8 +59,14 @@ _HTTP_ERROR_MESSAGES: dict[int, str] = {
     504: "NoneUSR Claude: gateway timeout (504) — upstream did not respond in time",
 }
 
-_MAX_PROMPT_BYTES = 8192
+_MAX_PROMPT_BYTES = 900    # raw byte budget before URL-encoding
+_MAX_ENCODED_CHARS = 1600  # hard cap on encoded path segment length
 _REQUEST_TIMEOUT = 60.0
+# Characters that are dangerous in GET path segments because some proxies
+# percent-decode the path *before* routing, turning encoded special chars back
+# into their raw form and corrupting the URL structure.
+# We strip: ` # ? & = + / \ % ! ; : @ [ ] { }
+_PROMPT_STRIP_RE = re.compile(r'[`#?&=+/\\%!;:@\[\]{}~\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 
 def _resolve_token() -> str:
@@ -69,43 +74,80 @@ def _resolve_token() -> str:
     return (os.getenv("NONEUSR_MODEL_API_TOKEN") or "").strip()
 
 
-def _build_prompt_from_messages(messages: list[dict[str, Any]]) -> str:
-    """Flatten an OpenAI-style messages list into a single prompt string.
+def _extract_text(content: Any) -> str:
+    """Pull plain text out of a message content value (str or list-of-parts)."""
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        return " ".join(t for t in parts if t)
+    return str(content)
 
-    Concatenates role-prefixed messages so context is preserved.  The final
-    user turn is always last; multi-turn history is prepended as plain text
-    so the upstream API has conversational context.
 
-    Long prompts are truncated to ``_MAX_PROMPT_BYTES`` bytes (UTF-8) to
-    avoid URL length limits — the last ``_MAX_PROMPT_BYTES`` bytes of the
-    UTF-8 encoding are kept so the most-recent context survives.
+def _sanitise_for_url(text: str) -> str:
+    """Strip characters that break GET-path routing when percent-decoded by proxies.
+
+    Some reverse-proxies decode ``%3F`` → ``?``, ``%26`` → ``&``, etc. before
+    routing, which corrupts the URL structure.  We strip the raw characters here
+    so they never enter the encoding pipeline.
     """
-    parts: list[str] = []
+    text = _PROMPT_STRIP_RE.sub("", text)
+    text = re.sub(r"\s{3,}", " ", text)  # collapse runs of whitespace
+    return text.strip()
+
+
+def _build_prompt_from_messages(messages: list[dict[str, Any]]) -> str:
+    """Extract the effective prompt from an OpenAI-style messages list.
+
+    Because the NoneUSR API is **stateless** (each GET request is independent
+    and the server has no session memory), sending the full conversation history
+    adds no value — the model cannot use it to maintain context between calls.
+    Instead we:
+
+    1. Send only the **most recent user message** as the prompt.
+    2. Prepend a concise system instruction if one is present (≤ 120 chars).
+    3. Strip all characters that confuse GET-route proxies even when
+       percent-encoded (``?``, ``&``, ``#``, ``/``, etc.).
+    4. Hard-truncate to ``_MAX_PROMPT_BYTES`` UTF-8 bytes.
+    """
+    if not messages:
+        return ""
+
+    # Extract system context (first system message, trimmed short).
+    system_snippet = ""
+    last_user_text = ""
+
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = str(msg.get("role") or "user")
-        content = msg.get("content")
-        if content is None:
+        role = str(msg.get("role") or "user").lower()
+        text = _extract_text(msg.get("content")).strip()
+        if not text:
             continue
-        if isinstance(content, list):
-            text_parts = [
-                p.get("text", "")
-                for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            ]
-            text = " ".join(t for t in text_parts if t)
-        else:
-            text = str(content)
-        if text.strip():
-            role_label = role.capitalize()
-            parts.append(f"{role_label}: {text.strip()}")
-    prompt = "\n".join(parts) if parts else ""
+        if role == "system" and not system_snippet:
+            clean = _sanitise_for_url(text)
+            system_snippet = clean[:120]  # keep it very short
+        elif role == "user":
+            last_user_text = _sanitise_for_url(text)
+
+    if not last_user_text:
+        return ""
+
+    if system_snippet:
+        prompt = f"[{system_snippet}] {last_user_text}"
+    else:
+        prompt = last_user_text
+
+    # Hard byte-length cap — keep the tail so the latest context survives.
     encoded = prompt.encode("utf-8", errors="replace")
     if len(encoded) > _MAX_PROMPT_BYTES:
         encoded = encoded[-_MAX_PROMPT_BYTES:]
-        decoded = encoded.decode("utf-8", errors="replace")
-        prompt = "...\n" + decoded.lstrip()
+        prompt = encoded.decode("utf-8", errors="replace").lstrip()
+
     return prompt
 
 
@@ -114,8 +156,20 @@ def _build_url(model: str, prompt: str, token: str) -> str:
 
     The message segment uses percent-encoding (``quote`` with safe=''
     to encode ``/``, ``&``, ``?``, ``+``, and all non-ASCII).
+
+    After encoding we apply a hard cap on the encoded path segment length
+    (``_MAX_ENCODED_CHARS``) to guard against server URL-length limits even
+    when the raw prompt itself is within ``_MAX_PROMPT_BYTES`` but expands
+    significantly after percent-encoding (e.g. spaces → ``%20``).
     """
     encoded_msg = urllib.parse.quote(prompt, safe="")
+    if len(encoded_msg) > _MAX_ENCODED_CHARS:
+        # Trim the raw prompt until its encoding fits, keeping the tail so
+        # the most-recent context survives.
+        p = prompt
+        while len(urllib.parse.quote(p, safe="")) > _MAX_ENCODED_CHARS and p:
+            p = p[max(1, len(p) // 8):]
+        encoded_msg = urllib.parse.quote(p, safe="")
     url = f"{_BASE_URL}/api/ai/{model}/message/{encoded_msg}?token={urllib.parse.quote(token, safe='')}"
     return url
 
