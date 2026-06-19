@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: hermes-agent-noneusr-claude
+    runtime: python
+    region: oregon
+    plan: free
+
+    buildCommand: pip install -e ".[web]" || pip install fastapi "uvicorn[standard]" httpx requests
+
+    startCommand: python render_server.py
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: PORT
+        generateValue: false
+      - key: NONEUSR_MODEL_API_TOKEN
+        sync: false
+      - key: RENDER_API_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
